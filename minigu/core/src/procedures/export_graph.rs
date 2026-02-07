@@ -4,8 +4,8 @@
 //! ```text
 //! <output‑dir>/
 //! ├── person.csv        #  vertex records labelled "person"
-//! ├── friend.csv        #  edge records labelled "friend"
-//! ├── follow.csv        #  edge records labelled "follow"
+//! ├── person_friend_person.csv   #  edge records labelled "friend"
+//! ├── person_follow_person.csv   #  edge records labelled "follow"
 //! └── manifest.json       #  manifest generated from `Manifest`
 //! ```
 //!
@@ -146,8 +146,10 @@ impl Manifest {
         let mut edge_specs = Vec::with_capacity(edge_infos.len());
 
         for (&id, (src_id, dst_id)) in edge_infos {
-            let name = metadata.label_map.get(&id).expect("label id not found");
-            let path = format!("{}.csv", name);
+            let src_name = metadata.label_map.get(src_id).expect("label id not found");
+            let dst_name = metadata.label_map.get(dst_id).expect("label id not found");
+            let edge_name = metadata.label_map.get(&id).expect("label id not found");
+            let path = format!("{}_{}_{}.csv", src_name, edge_name, dst_name);
             let props_schema = metadata
                 .schema
                 .get_edge_type(&LabelSet::from_iter(vec![id]))? // will return None for vertex (inverse call later)
@@ -161,7 +163,7 @@ impl Manifest {
             let dst_label = metadata.label_map.get(dst_id).unwrap().clone();
 
             edge_specs.push(EdgeSpec::new(
-                name.clone(),
+                edge_name.into(),
                 src_label,
                 dst_label,
                 FileSpec::new(path, "csv".to_string()),
@@ -250,14 +252,22 @@ struct EdgesBuilder {
 }
 
 impl EdgesBuilder {
-    fn new<P: AsRef<Path>>(dir: P, map: &HashMap<LabelId, String>) -> Result<Self> {
-        let mut writers = HashMap::with_capacity(map.len());
+    fn new<P: AsRef<Path>>(
+        dir: P,
+        label_map: &HashMap<LabelId, String>,
+        edge_infos: &HashMap<LabelId, (LabelId, LabelId)>,
+    ) -> Result<Self> {
+        let mut writers = HashMap::with_capacity(edge_infos.len());
 
-        for (&id, label) in map {
-            let filename = format!("{}.csv", label);
+        for (&edge_label_id, (src_label_id, dst_label_id)) in edge_infos {
+            let src_name = label_map.get(src_label_id).expect("label id not found");
+            let edge_name = label_map.get(&edge_label_id).expect("label id not found");
+            let dst_name = label_map.get(dst_label_id).expect("label id not found");
+
+            let filename = format!("{}_{}_{}.csv", src_name, edge_name, dst_name);
             let path = dir.as_ref().join(filename);
 
-            writers.insert(id, WriterBuilder::new().from_path(path)?);
+            writers.insert(edge_label_id, WriterBuilder::new().from_path(path)?);
         }
 
         Ok(Self {
@@ -316,7 +326,7 @@ pub(crate) fn export<P: AsRef<Path>>(
     let metadata = SchemaMetadata::from_schema(Arc::clone(&graph_type))?;
 
     let mut vertice_builder = VerticesBuilder::new(dir, &metadata.label_map)?;
-    let mut edges_builder = EdgesBuilder::new(dir, &metadata.label_map)?;
+    let mut edges_builder = EdgesBuilder::new(dir, &metadata.label_map, &metadata.edge_infos)?;
 
     // 2. Dump vertices
     for v in txn.iter_vertices() {
@@ -386,7 +396,7 @@ pub fn build_procedure() -> Procedure {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use minigu_catalog::memory::graph_type::{
         MemoryEdgeTypeCatalog, MemoryGraphTypeCatalog, MemoryVertexTypeCatalog,
@@ -633,12 +643,15 @@ mod tests {
 
     #[test]
     fn test_export_and_import() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let export_dir1 = tempfile::tempdir().unwrap();
-        let export_dir2 = tempfile::tempdir().unwrap();
+        // let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = Path::new("/tmp/tmp_dir");
+        // let export_dir1 = tempfile::tempdir().unwrap();
+        let export_dir1 = Path::new("/tmp/export_dir1");
+        // let export_dir2 = tempfile::tempdir().unwrap();
+        let export_dir2 = Path::new("/tmp/export_dir2");
 
-        let export_dir1 = export_dir1.path();
-        let export_dir2 = export_dir2.path();
+        // let export_dir1 = export_dir1.path();
+        // let export_dir2 = export_dir2.path();
 
         let manifest_rel_path = "manifest.json";
 

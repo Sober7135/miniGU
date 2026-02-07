@@ -83,6 +83,7 @@ lru = "0.16.3"
 macro_rules_attribute = "0.2.2"
 miette = { version = "7.6.0" }
 num-traits = "0.2.15"
+num_cpus = "1.17.0"
 ordered-float = { version = "5.0.0", features = ["serde"] }
 parking_lot = "0.12"
 pastey = "0.1.0"

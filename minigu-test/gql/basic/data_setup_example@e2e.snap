@@ -1,10 +1,12 @@
 ---
 source: minigu-test/src/insta_test.rs
-assertion_line: 217
+assertion_line: 276
 ---
 ┌─────────────────────────────────┐
 │ n                               │
 │ vertex { name::string }         │
+├─────────────────────────────────┤
+│ {_vid: 0, _label: 0, name: per} │
 ├─────────────────────────────────┤
 │ {_vid: 1, _label: 0, name: per} │
 ├─────────────────────────────────┤
@@ -13,7 +15,5 @@ assertion_line: 217
 │ {_vid: 3, _label: 0, name: per} │
 ├─────────────────────────────────┤
 │ {_vid: 4, _label: 0, name: per} │
-├─────────────────────────────────┤
-│ {_vid: 5, _label: 0, name: per} │
 └─────────────────────────────────┘
 5 rows

@@ -4,8 +4,8 @@
 //! ```text
 //! <output‑dir>/
 //! ├── person.csv        #  vertex records labelled "person"
-//! ├── friend.csv        #  edge records labelled "friend"
-//! ├── follow.csv        #  edge records labelled "follow"
+//! ├── person_friend_person.csv   #  edge records labelled "friend"
+//! ├── person_follow_person.csv   #  edge records labelled "follow"
 //! └── manifest.json       #  manifest generated from `Manifest`
 //! ```
 //!
@@ -35,6 +35,7 @@
 //!   schema mismatch, duplicate graph name, etc.) are surfaced via `Result`.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -56,6 +57,7 @@ use minigu_context::session::SessionContext;
 use minigu_storage::common::{Edge, PropertyRecord, Vertex};
 use minigu_storage::tp::MemoryGraph;
 use minigu_transaction::{GraphTxnManager, IsolationLevel, Transaction};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::common::{EdgeSpec, FileSpec, Manifest, RecordType, Result, VertexSpec};
 
@@ -123,6 +125,27 @@ fn build_properties<'a>(
     Ok(props)
 }
 
+// `VertexId` -> `([&'a EdgeSpec], current_index)`
+#[derive(Debug)]
+struct EdgePartitions<'a>(Vec<Vec<&'a EdgeSpec>>);
+
+impl<'a> EdgePartitions<'a> {
+    fn new(manifest: &'a Manifest) -> Self {
+        let mut hasher = DefaultHasher::new();
+        let num_workers = num_cpus::get_physical();
+
+        let mut inner = vec![vec![]; num_workers];
+
+        for edge_spec in manifest.edges_spec() {
+            edge_spec.src_label().hash(&mut hasher);
+            let hash = hasher.finish();
+            inner[(hash as usize) % num_workers].push(edge_spec);
+        }
+
+        EdgePartitions(inner)
+    }
+}
+
 pub fn import<P: AsRef<Path>>(
     context: SessionContext,
     graph_name: impl Into<String>,
@@ -171,12 +194,8 @@ pub(crate) fn import_internal<P: AsRef<Path>>(
             manifest_path.as_ref().display()
         )
     })?;
-    // Map each original vertex ID to it's newly assigned ID.
-    let mut vid_mapping = HashMap::new();
 
-    // 1. Vertices
-    let mut vid = 1;
-    for vertex_spec in manifest.vertices.iter() {
+    manifest.vertices.par_iter().try_for_each(|vertex_spec| {
         let path = manifest_parent_dir.join(&vertex_spec.file.path);
         let mut rdr = ReaderBuilder::new().has_headers(false).from_path(path)?;
 
@@ -193,50 +212,52 @@ pub(crate) fn import_internal<P: AsRef<Path>>(
                 .properties();
 
             assert_eq!(props_schema.len() + 1, record.len());
-            let old_vid: VertexId = record.get(0).expect("record to short").parse()?;
+            let vid: VertexId = record.get(0).expect("record to short").parse()?;
 
             let props = build_properties(props_schema, record.iter().skip(1))?;
             let vertex = Vertex::new(vid, label_id, PropertyRecord::new(props));
 
             graph.create_vertex(&txn, vertex)?;
-            // Update vid mapping
-            vid_mapping.insert(old_vid, vid);
-            vid += 1;
         }
-    }
 
-    // 2. Edges
-    let mut eid = 1;
-    for edge_spec in manifest.edges.iter() {
-        let path = manifest_parent_dir.join(&edge_spec.file.path);
-        let label_id = graph_type
-            .get_label_id(&edge_spec.label)?
-            .expect("label id not found");
+        Result::Ok(())
+    })?;
 
-        let mut rdr = ReaderBuilder::new().has_headers(false).from_path(path)?;
+    let edge_partitions = EdgePartitions::new(&manifest);
+    println!("{:#?}", edge_partitions);
 
-        for record in rdr.records() {
-            let record = record?;
-            let label_set = LabelSet::from_iter(vec![label_id]);
+    edge_partitions.0.par_iter().try_for_each(|partition| {
+        for edge_spec in partition.iter() {
+            let path = manifest_parent_dir.join(&edge_spec.file.path);
+            let label_id = graph_type
+                .get_label_id(&edge_spec.label)?
+                .expect("label id not found");
 
-            let props = graph_type
-                .get_edge_type(&label_set)?
-                .expect("edge type not found")
-                .properties();
+            let mut rdr = ReaderBuilder::new().has_headers(false).from_path(path)?;
 
-            assert_eq!(record.len() - 3, props.len());
-            let old_src_id = record.get(1).expect("record to short").parse()?;
-            let old_dst_id = record.get(2).expect("record to short").parse()?;
-            let src_id = vid_mapping.get(&old_src_id).expect("vid mapping not found");
-            let dst_id = vid_mapping.get(&old_dst_id).expect("vid mapping not found");
+            for record in rdr.records() {
+                let record = record?;
+                let label_set = LabelSet::from_iter(vec![label_id]);
 
-            let props = build_properties(props, record.iter().skip(3))?;
+                let props = graph_type
+                    .get_edge_type(&label_set)?
+                    .expect("edge type not found")
+                    .properties();
 
-            let edge = Edge::new(eid, *src_id, *dst_id, label_id, PropertyRecord::new(props));
-            graph.create_edge(&txn, edge)?;
-            eid += 1;
+                assert_eq!(record.len() - 3, props.len());
+                let eid = record.get(0).expect("record too short").parse()?;
+                let src_id = record.get(1).expect("record too short").parse()?;
+                let dst_id = record.get(2).expect("record too short").parse()?;
+
+                let props = build_properties(props, record.iter().skip(3))?;
+
+                let edge = Edge::new(eid, src_id, dst_id, label_id, PropertyRecord::new(props));
+                graph.create_edge(&txn, edge)?;
+            }
         }
-    }
+
+        Result::Ok(())
+    })?;
 
     let _ = txn.commit()?;
 

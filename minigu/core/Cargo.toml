@@ -23,6 +23,7 @@ minigu-execution = { workspace = true }
 minigu-planner = { workspace = true }
 minigu-storage = { workspace = true }
 minigu-transaction = { workspace = true }
+num_cpus = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
