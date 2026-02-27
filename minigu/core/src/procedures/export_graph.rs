@@ -35,7 +35,7 @@
 //! * Returns nothing. On success the files are written; errors (I/O failure, unknown graph, etc.)
 //!   are returned via `Result`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ use minigu_catalog::property::Property;
 use minigu_catalog::provider::{GraphProvider, GraphTypeProvider, SchemaProvider};
 use minigu_common::data_type::LogicalType;
 use minigu_common::error::not_implemented;
-use minigu_common::types::{EdgeId, LabelId, VertexId};
+use minigu_common::types::LabelId;
 use minigu_common::value::ScalarValue;
 use minigu_context::graph::{GraphContainer, GraphStorage};
 use minigu_context::procedure::Procedure;
@@ -54,24 +54,10 @@ use minigu_storage::common::{Edge, Vertex};
 use minigu_storage::tp::MemoryGraph;
 use minigu_transaction::{GraphTxnManager, IsolationLevel, Transaction};
 
-use super::common::{EdgeSpec, FileSpec, Manifest, RecordType, Result, VertexSpec};
+use super::common::{EdgeSpec, FileSpec, Manifest, Result, VertexSpec};
 
-// ============================================================================
-// Schema metadata for export
-// ============================================================================
-
-/// Cached lookup information derived from `GraphTypeProvider`.
-#[derive(Debug)]
-struct SchemaMetadata {
-    label_map: HashMap<LabelId, String>,
-    vertex_labels: HashSet<LabelId>,
-    edge_infos: HashMap<LabelId, (LabelId, LabelId)>,
-    schema: Arc<dyn GraphTypeProvider>,
-}
-
-impl SchemaMetadata {
-    fn from_schema(graph_type: Arc<dyn GraphTypeProvider>) -> Result<Self> {
-        // Build a label map LabelId -> String
+impl Manifest {
+    fn from_graph_type(graph_type: Arc<dyn GraphTypeProvider>) -> Result<Self> {
         let label_names = graph_type.label_names();
         let mut label_map = HashMap::with_capacity(label_names.len());
         for name in label_names {
@@ -79,55 +65,28 @@ impl SchemaMetadata {
             label_map.insert(label_id, name);
         }
 
-        let mut vertex_labels = HashSet::new();
-        let mut v_lset_to_label = HashMap::new();
-        let mut edge_infos = HashMap::new();
-        for (&id, _) in label_map.iter() {
-            let label_set = LabelSet::from_iter(vec![id]);
-
-            if let Some(edge_type) = graph_type
-                .get_edge_type(&label_set)
-                .expect("edge type not found")
-            {
-                let src_label_set = edge_type.src().label_set();
-                let dst_label_set = edge_type.dst().label_set();
-
-                edge_infos.insert(id, (src_label_set, dst_label_set));
+        let mut vertex_label_ids = Vec::new();
+        let mut vertex_label_set_to_id = HashMap::new();
+        let mut edge_infos = Vec::new();
+        for &label_id in label_map.keys() {
+            let label_set = LabelSet::from_iter(vec![label_id]);
+            if let Some(edge_type) = graph_type.get_edge_type(&label_set)? {
+                edge_infos.push((
+                    label_id,
+                    edge_type.src().label_set(),
+                    edge_type.dst().label_set(),
+                ));
             } else {
-                vertex_labels.insert(id);
-                v_lset_to_label.insert(label_set, id);
+                vertex_label_ids.push(label_id);
+                vertex_label_set_to_id.insert(label_set, label_id);
             }
         }
 
-        let edge_infos = edge_infos
-            .iter()
-            .map(|(&id, (src, dst))| {
-                let src_id = *v_lset_to_label.get(src).expect("label set not found");
-                let dst_id = *v_lset_to_label.get(dst).expect("label set not found");
-
-                (id, (src_id, dst_id))
-            })
-            .collect();
-
-        Ok(Self {
-            label_map,
-            vertex_labels,
-            edge_infos,
-            schema: Arc::clone(&graph_type),
-        })
-    }
-}
-
-impl Manifest {
-    fn from_schema(metadata: SchemaMetadata) -> Result<Self> {
-        let vertex_labels = &metadata.vertex_labels;
-        let mut vertex_specs = Vec::with_capacity(vertex_labels.len());
-
-        for &id in vertex_labels {
-            let name = metadata.label_map.get(&id).expect("label id not found");
+        let mut vertex_specs = Vec::with_capacity(vertex_label_ids.len());
+        for id in vertex_label_ids {
+            let name = label_map.get(&id).expect("label id not found");
             let path = format!("{}.csv", name);
-            let props_schema = metadata
-                .schema
+            let props_schema = graph_type
                 .get_vertex_type(&LabelSet::from_iter(vec![id]))? // will return None for vertex (inverse call later)
                 .expect("vertex type not found")
                 .properties()
@@ -142,25 +101,29 @@ impl Manifest {
             ))
         }
 
-        let edge_infos = &metadata.edge_infos;
         let mut edge_specs = Vec::with_capacity(edge_infos.len());
+        for (edge_id, src_label_set, dst_label_set) in edge_infos {
+            let src_id = *vertex_label_set_to_id
+                .get(&src_label_set)
+                .expect("source label set not found");
+            let dst_id = *vertex_label_set_to_id
+                .get(&dst_label_set)
+                .expect("destination label set not found");
 
-        for (&id, (src_id, dst_id)) in edge_infos {
-            let src_name = metadata.label_map.get(src_id).expect("label id not found");
-            let dst_name = metadata.label_map.get(dst_id).expect("label id not found");
-            let edge_name = metadata.label_map.get(&id).expect("label id not found");
+            let src_name = label_map.get(&src_id).expect("label id not found");
+            let dst_name = label_map.get(&dst_id).expect("label id not found");
+            let edge_name = label_map.get(&edge_id).expect("label id not found");
             let path = format!("{}_{}_{}.csv", src_name, edge_name, dst_name);
-            let props_schema = metadata
-                .schema
-                .get_edge_type(&LabelSet::from_iter(vec![id]))? // will return None for vertex (inverse call later)
+            let props_schema = graph_type
+                .get_edge_type(&LabelSet::from_iter(vec![edge_id]))? // will return None for vertex (inverse call later)
                 .expect("edge type not found")
                 .properties()
                 .into_iter()
                 .map(|prop| prop.1) // drop index key
                 .collect::<Vec<_>>();
 
-            let src_label = metadata.label_map.get(src_id).unwrap().clone();
-            let dst_label = metadata.label_map.get(dst_id).unwrap().clone();
+            let src_label = label_map.get(&src_id).expect("label id not found").clone();
+            let dst_label = label_map.get(&dst_id).expect("label id not found").clone();
 
             edge_specs.push(EdgeSpec::new(
                 edge_name.into(),
@@ -194,25 +157,27 @@ fn get_graph_from_graph_container(container: Arc<dyn GraphProvider>) -> Result<A
 
 #[derive(Debug)]
 struct VerticesBuilder {
-    records: HashMap<LabelId, BTreeMap<VertexId, RecordType>>,
     writers: HashMap<LabelId, Writer<File>>,
 }
 
 impl VerticesBuilder {
-    fn new<P: AsRef<Path>>(dir: P, map: &HashMap<LabelId, String>) -> Result<Self> {
-        let mut writers = HashMap::with_capacity(map.len());
+    fn new<P: AsRef<Path>>(
+        dir: P,
+        manifest: &Manifest,
+        graph_type: Arc<dyn GraphTypeProvider>,
+    ) -> Result<Self> {
+        let mut writers = HashMap::with_capacity(manifest.vertices_spec().len());
 
-        for (&id, label) in map {
-            let filename = format!("{}.csv", label);
-            let path = dir.as_ref().join(filename);
+        for vertex_spec in manifest.vertices_spec() {
+            let label_id = graph_type
+                .get_label_id(vertex_spec.label_name())?
+                .expect("label id not found");
+            let path = dir.as_ref().join(vertex_spec.file.path.as_str());
 
-            writers.insert(id, WriterBuilder::new().from_path(path)?);
+            writers.insert(label_id, WriterBuilder::new().from_path(path)?);
         }
 
-        Ok(Self {
-            records: HashMap::new(),
-            writers,
-        })
+        Ok(Self { writers })
     }
 
     fn add_vertex(&mut self, v: &Vertex) -> Result<()> {
@@ -224,21 +189,18 @@ impl VerticesBuilder {
             record.push(value_str);
         }
 
-        self.records
-            .entry(v.label_id)
-            .or_default()
-            .insert(v.vid(), record);
+        let writer = self
+            .writers
+            .get_mut(&v.label_id)
+            .expect("writer not found for vertex label");
+        writer.write_record(record)?;
 
         Ok(())
     }
 
-    fn dump(&mut self) -> Result<()> {
-        for (label_id, records) in self.records.iter() {
-            let w = self.writers.get_mut(label_id).expect("writer not found");
-
-            for (_, record) in records.iter() {
-                w.write_record(record)?;
-            }
+    fn finish(&mut self) -> Result<()> {
+        for writer in self.writers.values_mut() {
+            writer.flush()?;
         }
 
         Ok(())
@@ -247,33 +209,27 @@ impl VerticesBuilder {
 
 #[derive(Debug)]
 struct EdgesBuilder {
-    records: HashMap<LabelId, BTreeMap<EdgeId, RecordType>>,
     writers: HashMap<LabelId, Writer<File>>,
 }
 
 impl EdgesBuilder {
     fn new<P: AsRef<Path>>(
         dir: P,
-        label_map: &HashMap<LabelId, String>,
-        edge_infos: &HashMap<LabelId, (LabelId, LabelId)>,
+        manifest: &Manifest,
+        graph_type: Arc<dyn GraphTypeProvider>,
     ) -> Result<Self> {
-        let mut writers = HashMap::with_capacity(edge_infos.len());
+        let mut writers = HashMap::with_capacity(manifest.edges_spec().len());
 
-        for (&edge_label_id, (src_label_id, dst_label_id)) in edge_infos {
-            let src_name = label_map.get(src_label_id).expect("label id not found");
-            let edge_name = label_map.get(&edge_label_id).expect("label id not found");
-            let dst_name = label_map.get(dst_label_id).expect("label id not found");
-
-            let filename = format!("{}_{}_{}.csv", src_name, edge_name, dst_name);
-            let path = dir.as_ref().join(filename);
+        for edge_spec in manifest.edges_spec() {
+            let edge_label_id = graph_type
+                .get_label_id(edge_spec.label_name())?
+                .expect("label id not found");
+            let path = dir.as_ref().join(edge_spec.file.path.as_str());
 
             writers.insert(edge_label_id, WriterBuilder::new().from_path(path)?);
         }
 
-        Ok(Self {
-            records: HashMap::new(),
-            writers,
-        })
+        Ok(Self { writers })
     }
 
     fn add_edge(&mut self, e: &Edge) -> Result<()> {
@@ -289,20 +245,17 @@ impl EdgesBuilder {
             record.push(value_str);
         }
 
-        self.records
-            .entry(e.label_id)
-            .or_default()
-            .insert(e.eid(), record);
+        let writer = self
+            .writers
+            .get_mut(&e.label_id)
+            .expect("writer not found for edge label");
+        writer.write_record(record)?;
         Ok(())
     }
 
-    fn dump(&mut self) -> Result<()> {
-        for (label_id, records) in self.records.iter() {
-            let w = self.writers.get_mut(label_id).expect("writers not found");
-
-            for (_, record) in records.iter() {
-                w.write_record(record)?;
-            }
+    fn finish(&mut self) -> Result<()> {
+        for writer in self.writers.values_mut() {
+            writer.flush()?;
         }
 
         Ok(())
@@ -323,25 +276,24 @@ pub(crate) fn export<P: AsRef<Path>>(
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
 
-    let metadata = SchemaMetadata::from_schema(Arc::clone(&graph_type))?;
+    let manifest = Manifest::from_graph_type(Arc::clone(&graph_type))?;
 
-    let mut vertice_builder = VerticesBuilder::new(dir, &metadata.label_map)?;
-    let mut edges_builder = EdgesBuilder::new(dir, &metadata.label_map, &metadata.edge_infos)?;
+    let mut vertice_builder = VerticesBuilder::new(dir, &manifest, Arc::clone(&graph_type))?;
+    let mut edges_builder = EdgesBuilder::new(dir, &manifest, Arc::clone(&graph_type))?;
 
     // 2. Dump vertices
     for v in txn.iter_vertices() {
         vertice_builder.add_vertex(&v?)?;
     }
-    vertice_builder.dump()?;
+    vertice_builder.finish()?;
 
     // 3. Dump edge
     for e in txn.iter_edges() {
         edges_builder.add_edge(&e?)?;
     }
-    edges_builder.dump()?;
+    edges_builder.finish()?;
 
     // 4. Dump manifest
-    let manifest = Manifest::from_schema(metadata)?;
     std::fs::write(
         dir.join(manifest_rel_path),
         serde_json::to_string(&manifest)?,
@@ -396,7 +348,7 @@ pub fn build_procedure() -> Procedure {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use minigu_catalog::memory::graph_type::{
         MemoryEdgeTypeCatalog, MemoryGraphTypeCatalog, MemoryVertexTypeCatalog,
@@ -621,7 +573,7 @@ mod tests {
                 assert!(entry1.file_type().is_file());
 
                 let filename1 = dir1.join(filename1);
-                let filename2 = dir1.join(filename2);
+                let filename2 = dir2.join(filename2);
 
                 // Make sure the manifest file name is ended with ".json"
                 if filename1.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -630,6 +582,38 @@ mod tests {
                     let v2: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(filename2).unwrap()).unwrap();
                     return v1 == v2;
+                }
+
+                if filename1.extension().and_then(|e| e.to_str()) == Some("csv") {
+                    let mut rows1 = csv::ReaderBuilder::new()
+                        .has_headers(false)
+                        .from_path(&filename1)
+                        .unwrap()
+                        .records()
+                        .map(|record| {
+                            record
+                                .unwrap()
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut rows2 = csv::ReaderBuilder::new()
+                        .has_headers(false)
+                        .from_path(&filename2)
+                        .unwrap()
+                        .records()
+                        .map(|record| {
+                            record
+                                .unwrap()
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    rows1.sort_unstable();
+                    rows2.sort_unstable();
+                    return rows1 == rows2;
                 }
 
                 // Check if the file size is the same
@@ -643,15 +627,11 @@ mod tests {
 
     #[test]
     fn test_export_and_import() {
-        // let temp_dir = tempfile::tempdir().unwrap();
-        let temp_dir = Path::new("/tmp/tmp_dir");
-        // let export_dir1 = tempfile::tempdir().unwrap();
-        let export_dir1 = Path::new("/tmp/export_dir1");
-        // let export_dir2 = tempfile::tempdir().unwrap();
-        let export_dir2 = Path::new("/tmp/export_dir2");
+        let export_dir1 = tempfile::tempdir().unwrap();
+        let export_dir2 = tempfile::tempdir().unwrap();
 
-        // let export_dir1 = export_dir1.path();
-        // let export_dir2 = export_dir2.path();
+        let export_dir1 = export_dir1.path();
+        let export_dir2 = export_dir2.path();
 
         let manifest_rel_path = "manifest.json";
 
